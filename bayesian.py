@@ -1,0 +1,413 @@
+"""
+bayes_opt_cifar10.py
+
+Complete, self-contained project script that demonstrates Bayesian Optimization (with scikit-optimize)
+for hyperparameter tuning of a convolutional neural network on CIFAR-10 using PyTorch.
+
+Features:
+- Modular, documented functions and PEP8-style docstrings
+- Reproducible (seed control)
+- Dataset preparation and augmentations
+- Simple CNN model definition (configurable depth/width)
+- Training and validation loops with checkpointing
+- Objective wrapper for skopt (Bayesian Optimization)
+- Baseline Random Search comparison
+- Logging of trial results to CSV
+- Simple matplotlib plots saved to disk for convergence comparison
+
+Requirements:
+- Python 3.8+
+- torch, torchvision
+- scikit-optimize
+- numpy, pandas, matplotlib
+
+Usage example:
+python bayes_opt_cifar10.py --mode bayes --trials 25 --output_dir ./results
+
+"""
+
+import argparse
+import json
+import os
+import random
+import time
+from copy import deepcopy
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+from skopt import gp_minimize
+from skopt.space import Real, Integer, Categorical
+from skopt.utils import use_named_args
+
+# ----------------------------- Reproducibility helpers -----------------------------
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ----------------------------- Model definition ----------------------------------
+
+class SimpleConvNet(nn.Module):
+    """A configurable simple convolutional network for CIFAR-10.
+
+    Args:
+        num_filters_base: base number of filters in first conv layer; gets doubled in deeper layers
+        num_layers: how many conv blocks (1-4 recommended)
+        dropout: dropout rate applied before classifier
+    """
+
+    def __init__(self, num_filters_base: int = 32, num_layers: int = 3, dropout: float = 0.3, num_classes: int = 10):
+        super().__init__()
+        layers = []
+        in_ch = 3
+        out_ch = num_filters_base
+        for i in range(num_layers):
+            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
+            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1))
+            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.MaxPool2d(2))
+            in_ch = out_ch
+            out_ch = min(out_ch * 2, 512)
+
+        self.feature_extractor = nn.Sequential(*layers)
+        # compute feature size for CIFAR (32x32) after pooling
+        final_spatial = 32 // (2 ** num_layers)
+        final_ch = in_ch
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=dropout),
+            nn.Linear(final_ch * final_spatial * final_spatial, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        x = self.classifier(x)
+        return x
+
+
+# ----------------------------- Data utilities ------------------------------------
+
+def get_dataloaders(data_dir: str, batch_size: int = 128, num_workers: int = 4) -> tuple:
+    """Return train and validation dataloaders for CIFAR-10.
+
+    Uses a simple train-time augmentation pipeline and a deterministic validation transform.
+    """
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+    ])
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+    ])
+
+    train_set = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
+    val_set = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=transform_val)
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    return train_loader, val_loader
+
+
+# ----------------------------- Training / Evaluation -------------------------------
+
+def train_one_epoch(model, device, dataloader, optimizer, criterion):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for data, target in dataloader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        outputs = model(data)
+        loss = criterion(outputs, target)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * data.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == target).sum().item()
+        total += data.size(0)
+    avg_loss = running_loss / total
+    acc = correct / total
+    return avg_loss, acc
+
+
+def validate(model, device, dataloader, criterion):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, target)
+            running_loss += loss.item() * data.size(0)
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == target).sum().item()
+            total += data.size(0)
+    avg_loss = running_loss / total
+    acc = correct / total
+    return avg_loss, acc
+
+
+# ----------------------------- Objective & Optimization ---------------------------
+
+class ObjectiveLogger:
+    """Simple logger to store trial results and save to CSV."""
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.records = []
+
+    def add(self, trial_id: int, params: dict, val_loss: float, val_acc: float, elapsed: float):
+        rec = dict(trial=trial_id, val_loss=val_loss, val_acc=val_acc, elapsed=elapsed)
+        rec.update(params)
+        self.records.append(rec)
+
+    def save(self, filename: str = "trials.csv"):
+        df = pd.DataFrame(self.records)
+        path = os.path.join(self.output_dir, filename)
+        df.to_csv(path, index=False)
+        return path
+
+
+def build_optimizer(optimizer_name: str, model_parameters, lr: float, weight_decay: float):
+    if optimizer_name.lower() == "adam":
+        return optim.Adam(model_parameters, lr=lr, weight_decay=weight_decay)
+    elif optimizer_name.lower() == "sgd":
+        return optim.SGD(model_parameters, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+
+def run_training_trial(trial_id: int, params: dict, device, train_loader, val_loader, output_dir: str, epochs: int = 12, seed: int = 42):
+    """Run a single training trial with given hyperparameters. Returns validation loss and accuracy."""
+    set_seed(seed + trial_id)
+    model = SimpleConvNet(num_filters_base=params["num_filters"], num_layers=params["num_layers"], dropout=params["dropout"]) 
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = build_optimizer(params["optimizer"], model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"])
+
+    best_val_loss = float("inf")
+    best_state = None
+    start = time.time()
+    for epoch in range(1, epochs + 1):
+        train_loss, train_acc = train_one_epoch(model, device, train_loader, optimizer, criterion)
+        val_loss, val_acc = validate(model, device, val_loader, criterion)
+        # simple live print (can be redirected to logs)
+        print(f"Trial {trial_id} Epoch {epoch}/{epochs} - train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = deepcopy(model.state_dict())
+    elapsed = time.time() - start
+    # save best checkpoint
+    chk_path = os.path.join(output_dir, f"trial_{trial_id}_best.pth")
+    torch.save({"model_state": best_state, "params": params}, chk_path)
+    return best_val_loss, val_acc, elapsed, chk_path
+
+
+# ----------------------------- Search spaces & wrappers ---------------------------
+
+# Define the skopt search space
+search_space = [
+    Integer(16, 128, name="num_filters"),
+    Integer(1, 4, name="num_layers"),
+    Real(1e-4, 1e-1, prior="log-uniform", name="lr"),
+    Real(0.0, 0.001, name="weight_decay"),
+    Real(0.0, 0.6, name="dropout"),
+    Categorical(["adam", "sgd"], name="optimizer"),
+    Integer(64, 256, name="batch_size"),
+]
+
+# helper to map skopt point -> param dict
+
+def point_to_params(point) -> dict:
+    return {
+        "num_filters": int(point[0]),
+        "num_layers": int(point[1]),
+        "lr": float(point[2]),
+        "weight_decay": float(point[3]),
+        "dropout": float(point[4]),
+        "optimizer": str(point[5]),
+        "batch_size": int(point[6]),
+    }
+
+
+# We'll create a closure for skopt's use_named_args
+
+def make_objective(device, data_dir, base_output_dir, epochs: int, seed: int = 42):
+    """Returns a function compatible with skopt that takes hyperparameters and returns validation loss."""
+    logger = ObjectiveLogger(output_dir=base_output_dir)
+    trial_counter = {"n": 0}
+
+    @use_named_args(search_space)
+    def objective(**kwargs):
+        # build params dict
+        trial_id = trial_counter["n"]
+        trial_counter["n"] += 1
+        params = {
+            "num_filters": int(kwargs["num_filters"]),
+            "num_layers": int(kwargs["num_layers"]),
+            "lr": float(kwargs["lr"]),
+            "weight_decay": float(kwargs["weight_decay"]),
+            "dropout": float(kwargs["dropout"]),
+            "optimizer": str(kwargs["optimizer"]),
+            "batch_size": int(kwargs["batch_size"]),
+        }
+        print(f"Starting trial {trial_id} with params: {params}")
+
+        # get dataloaders with requested batch size
+        train_loader, val_loader = get_dataloaders(data_dir, batch_size=params["batch_size"]) 
+        val_loss, val_acc, elapsed, chk = run_training_trial(trial_id, params, device, train_loader, val_loader, base_output_dir, epochs=epochs, seed=seed)
+        logger.add(trial_id, params, val_loss, val_acc, elapsed)
+        # save incremental
+        logger.save(filename="trials_progress.csv")
+        # skopt minimizes the returned value -> we return validation loss
+        return float(val_loss)
+
+    # attach logger for later retrieval
+    objective._logger = logger
+    objective._trial_counter = trial_counter
+    return objective
+
+
+# ----------------------------- Random Search baseline -----------------------------
+
+def run_random_search(n_trials: int, device, data_dir: str, output_dir: str, epochs: int = 12, seed: int = 42):
+    set_seed(seed)
+    logger = ObjectiveLogger(output_dir=output_dir)
+    for tid in range(n_trials):
+        params = {
+            "num_filters": int(random.randint(16, 128)),
+            "num_layers": int(random.randint(1, 4)),
+            "lr": 10 ** random.uniform(-4, -1),
+            "weight_decay": random.uniform(0.0, 0.001),
+            "dropout": random.uniform(0.0, 0.6),
+            "optimizer": random.choice(["adam", "sgd"]),
+            "batch_size": int(random.randint(64, 256)),
+        }
+        print(f"Random trial {tid} params: {params}")
+        train_loader, val_loader = get_dataloaders(data_dir, batch_size=params["batch_size"]) 
+        val_loss, val_acc, elapsed, chk = run_training_trial(tid, params, device, train_loader, val_loader, output_dir, epochs=epochs, seed=seed)
+        logger.add(tid, params, val_loss, val_acc, elapsed)
+        logger.save(filename="random_trials_progress.csv")
+    return logger.save(filename="random_trials.csv")
+
+
+# ----------------------------- Analysis & Plotting --------------------------------
+
+def plot_convergence(bayes_csv: str, random_csv: str, output_dir: str):
+    df_b = pd.read_csv(bayes_csv)
+    df_r = pd.read_csv(random_csv)
+    # ensure sorted by trial index
+    df_b = df_b.sort_values("trial").reset_index(drop=True)
+    df_r = df_r.sort_values("trial").reset_index(drop=True)
+
+    plt.figure()
+    plt.plot(df_b["trial"], df_b["val_loss"], label="Bayes (val_loss)")
+    plt.scatter(df_b["trial"], df_b["val_loss"], s=20)
+    plt.plot(df_r["trial"], df_r["val_loss"], label="Random (val_loss)")
+    plt.scatter(df_r["trial"], df_r["val_loss"], s=20)
+    plt.xlabel("Trial")
+    plt.ylabel("Validation Loss")
+    plt.title("Convergence Comparison: Bayesian Optimization vs Random Search")
+    plt.legend()
+    plt.grid(True)
+    out = os.path.join(output_dir, "convergence_comparison.png")
+    plt.savefig(out, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+# ----------------------------- CLI and orchestration -------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Bayesian Optimization for CIFAR-10 hyperparameter tuning")
+    parser.add_argument("--data_dir", type=str, default="./data", help="directory to download CIFAR-10")
+    parser.add_argument("--output_dir", type=str, default="./results", help="directory to save results")
+    parser.add_argument("--mode", type=str, choices=["bayes", "random", "both"], default="both", help="which search to run")
+    parser.add_argument("--trials", type=int, default=25, help="number of trials for bayes or random")
+    parser.add_argument("--epochs", type=int, default=12, help="training epochs per trial (small for quicker experiments)")
+    parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="device to use")
+    parser.add_argument("--gp_random_starts", type=int, default=5, help="initial random points for gp_minimize")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_out = os.path.join(args.output_dir, timestamp)
+    os.makedirs(base_out, exist_ok=True)
+
+    # copy args for reproducibility
+    with open(os.path.join(base_out, "run_config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    bayes_csv = None
+    random_csv = None
+
+    if args.mode in ("bayes", "both"):
+        print("Preparing Bayesian Optimization...")
+        obj = make_objective(device, args.data_dir, os.path.join(base_out, "bayes"), epochs=args.epochs, seed=args.seed)
+        # run gp_minimize
+        res = gp_minimize(func=obj, dimensions=search_space, n_calls=args.trials, n_random_starts=args.gp_random_starts, random_state=args.seed)
+        # save skopt result object
+        import pickle
+
+        with open(os.path.join(base_out, "bayes_res.pkl"), "wb") as f:
+            pickle.dump(res, f)
+        # save trials
+        bayes_csv = os.path.join(base_out, "bayes", "trials_progress.csv")
+        # final save
+        obj._logger.save(filename="bayes_trials_final.csv")
+        bayes_csv = os.path.join(base_out, "bayes", "bayes_trials_final.csv")
+
+    if args.mode in ("random", "both"):
+        print("Preparing Random Search baseline...")
+        rs_out = os.path.join(base_out, "random")
+        os.makedirs(rs_out, exist_ok=True)
+        random_csv = run_random_search(args.trials, device, args.data_dir, rs_out, epochs=args.epochs, seed=args.seed)
+
+    # if both runs exist, plot a convergence comparison
+    if bayes_csv and random_csv:
+        out_plot = plot_convergence(bayes_csv, random_csv, base_out)
+        print(f"Convergence plot saved to: {out_plot}")
+
+    print(f"All done. Results saved under: {base_out}")
+
+
+if __name__ == "__main__":
+    main()
